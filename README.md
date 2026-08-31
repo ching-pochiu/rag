@@ -60,6 +60,28 @@ flowchart TB
 | 引用頁碼反查 | 答案引用的頁碼若不在這次檢索範圍內，主動跳警告 | 防止 LLM 編造看似合理但查無來源的引用 |
 | 規則式雙軌對照 | 額外用正則規則直接從表格索引查 SD/SR 鋼筋牌號數據 | 不透過 LLM，對關鍵數值提供一條獨立、可驗證的查詢路徑 |
 
+## 實際運作截圖
+
+**上傳規範 PDF、建立索引**
+
+![上傳 PDF](screenshots/01_upload.png)
+
+**輸入查詢問題**
+
+![輸入查詢](screenshots/02_query.png)
+
+**AI 智慧摘要：精確引用頁碼與表格編號回答**
+
+![AI 智慧摘要](screenshots/03_answer.png)
+
+**檢索來源：可看到每筆候選的 Rerank 分數**
+
+![檢索來源](screenshots/04_sources.png)
+
+**規則比對：SD/SR 鋼筋牌號直接查表，跟 AI 答案雙軌對照**
+
+![規則比對](screenshots/05_rule_lookup.png)
+
 ## 技術棧
 
 - **前端 / 應用框架**：Streamlit
