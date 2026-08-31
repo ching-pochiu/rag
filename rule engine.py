@@ -15,7 +15,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
-st.set_page_config(page_title="土木規範 AI 智慧檢索系統 (Google Gemini 版)", layout="wide")
+st.set_page_config(
+    page_title="土木規範 AI 智慧檢索系統 (Google Gemini 版)",
+    page_icon="🏗️",
+    layout="wide",
+)
 st.title("🏗️ 土木工程規範問答系統 (Gemini 雙軌對照版)")
 
 # Google API Key
@@ -791,47 +795,55 @@ if uploaded_files:
         if res["llm_error"]:
             st.error(f"呼叫 Gemini API 失敗：{res['llm_error']}")
 
-        if response:
-            st.subheader("💡 Gemini AI 智慧摘要")
-            st.markdown(response)
-
-            # Groundedness 檢查：答案中的數字若查無原文依據，提醒人工複核
-            ungrounded = check_groundedness(response, context_str)
-            if ungrounded:
-                st.warning(
-                    "⚠️ 以下數字在檢索到的原文中找不到直接依據，"
-                    "可能是 AI 推論或誤植，請人工複核：" + "、".join(ungrounded)
-                )
-
-            # 引用頁碼檢查：答案提到的頁碼若不在這次檢索到的文件中，代表引用可能是編的
-            bad_citations = check_citation_pages(response, combined_docs)
-            if bad_citations:
-                st.warning(
-                    "⚠️ 答案引用了「第 "
-                    + "、".join(bad_citations)
-                    + " 頁」，但這些頁碼並不在這次實際檢索到的內容中，引用可能有誤，請人工複核。"
-                )
-
         grade_hits = res["grade_hits"]
-        if grade_hits:
-            st.subheader("🎯 規則比對結果（直接讀表，雙重比對）")
-            for candidates in grade_hits:
-                top = candidates[0]
-                st.markdown(f"**鋼筋牌號：{top['grade']}**（來源：{top['doc_name']} {top['page']}）")
-                df = pd.DataFrame({"欄位項目": top["header"], "規範數據值": top["row"]})
-                st.table(df)
-                if len(candidates) > 1:
-                    with st.expander(f"同一牌號在其他 {len(candidates) - 1} 處也有出現，可能為不同版本或章節，點此展開比對"):
-                        for other in candidates[1:]:
-                            st.markdown(f"來源：{other['doc_name']} {other['page']}")
-                            st.table(pd.DataFrame({"欄位項目": other["header"], "規範數據值": other["row"]}))
+        tab_answer, tab_rules, tab_sources = st.tabs(
+            ["💡 AI 智慧摘要", "🎯 規則比對", "📊 檢索來源"]
+        )
 
-        st.subheader("📊 檢索到的原始數據表格與條文內文")
-        for i, doc in enumerate(combined_docs, start=1):
-            rerank_score = doc.metadata.get("rerank_score")
-            score_label = f"｜Rerank 分數：{rerank_score:.3f}" if rerank_score is not None else ""
-            st.success(f"📍 引用來源：{doc.metadata.get('doc_name')} ({doc.metadata.get('page')}){score_label}")
-            st.markdown(doc.page_content)
-            st.divider()
+        with tab_answer:
+            if response:
+                st.markdown(response)
+
+                # Groundedness 檢查：答案中的數字若查無原文依據，提醒人工複核
+                ungrounded = check_groundedness(response, context_str)
+                if ungrounded:
+                    st.warning(
+                        "⚠️ 以下數字在檢索到的原文中找不到直接依據，"
+                        "可能是 AI 推論或誤植，請人工複核：" + "、".join(ungrounded)
+                    )
+
+                # 引用頁碼檢查：答案提到的頁碼若不在這次檢索到的文件中，代表引用可能是編的
+                bad_citations = check_citation_pages(response, combined_docs)
+                if bad_citations:
+                    st.warning(
+                        "⚠️ 答案引用了「第 "
+                        + "、".join(bad_citations)
+                        + " 頁」，但這些頁碼並不在這次實際檢索到的內容中，引用可能有誤，請人工複核。"
+                    )
+            else:
+                st.info("這次查詢沒有產生 AI 回答。")
+
+        with tab_rules:
+            if grade_hits:
+                for candidates in grade_hits:
+                    top = candidates[0]
+                    st.markdown(f"**鋼筋牌號：{top['grade']}**（來源：{top['doc_name']} {top['page']}）")
+                    df = pd.DataFrame({"欄位項目": top["header"], "規範數據值": top["row"]})
+                    st.table(df)
+                    if len(candidates) > 1:
+                        with st.expander(f"同一牌號在其他 {len(candidates) - 1} 處也有出現，可能為不同版本或章節，點此展開比對"):
+                            for other in candidates[1:]:
+                                st.markdown(f"來源：{other['doc_name']} {other['page']}")
+                                st.table(pd.DataFrame({"欄位項目": other["header"], "規範數據值": other["row"]}))
+            else:
+                st.info("這次查詢沒有偵測到 SD/SR 鋼筋牌號，無規則比對結果。")
+
+        with tab_sources:
+            for i, doc in enumerate(combined_docs, start=1):
+                rerank_score = doc.metadata.get("rerank_score")
+                score_label = f"｜Rerank 分數：{rerank_score:.3f}" if rerank_score is not None else ""
+                st.success(f"📍 引用來源：{doc.metadata.get('doc_name')} ({doc.metadata.get('page')}){score_label}")
+                st.markdown(doc.page_content)
+                st.divider()
 else:
     st.info("👈 請先於左側邊欄上傳土木規範 PDF 檔案。")
