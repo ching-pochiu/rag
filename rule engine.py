@@ -876,23 +876,39 @@ def check_citation_pages(response: str, combined_docs: list) -> list:
 # 規則比對
 # ──────────────────────────────────────────────────────────────
 
-_CODE_PATTERN = re.compile(r"(?:SD|SR)\s*\d{2,4}\s*W?", re.IGNORECASE)
+# 兩種可查表的代號格式：SD/SR 鋼筋牌號、D 開頭的標稱尺寸稱號（如 D19）。
+# 各自的正則規則跟「這是代號欄位」的表頭關鍵字不一樣，用同一套邏輯分開處理，
+# 之後如果要再擴充其他代號格式，只要在這個清單裡加一組設定就好。
+_CODE_FAMILIES = [
+    {
+        "pattern": re.compile(r"(?:SD|SR)\s*\d{2,4}\s*W?", re.IGNORECASE),
+        "header_keywords": ("符號", "牌號"),
+    },
+    {
+        # 不用 \b 判斷邊界：Python 預設把中文字也算進 \w，跟英數字之間
+        # 不會產生字界，導致「D19和SD420」這種中文字緊貼代號、沒有空格
+        # 分隔的寫法會抓不到。改用「前面不是英數字、後面不是數字」的
+        # 環顧判斷，同時也能避免誤吃到「SD420」裡的「D420」。
+        "pattern": re.compile(r"(?<![A-Za-z0-9])D\d{1,3}(?!\d)"),
+        "header_keywords": ("稱號",),
+    },
+]
 
 
 def _normalize_code(text: str) -> str:
     return text.replace(" ", "").upper()
 
 
-def _find_code_column(header, rows):
+def _find_code_column(header, rows, pattern, header_keywords):
     for idx, h in enumerate(header):
-        if "符號" in h or "牌號" in h:
+        if any(kw in h for kw in header_keywords):
             return idx
 
     best_idx, best_score = None, 0
     for idx in range(len(header)):
         score = sum(
             1 for r in rows
-            if idx < len(r) and _CODE_PATTERN.search(r[idx])
+            if idx < len(r) and pattern.search(r[idx])
         )
         if score > best_score:
             best_score, best_idx = score, idx
@@ -906,12 +922,15 @@ def _text_overlap_score(query: str, header: list) -> int:
 
 
 def lookup_grades(query: str, table_index: list):
-    codes = _CODE_PATTERN.findall(query)
-    query_codes = []
-    for c in codes:
-        nc = _normalize_code(c)
-        if nc not in query_codes:
-            query_codes.append(nc)
+    # 每個查詢代號都記住自己屬於哪個代號格式（pattern + header_keywords），
+    # 同一份 table_index 對不同代號格式各自找一次欄位——同一張表可能同時有
+    # 「符號」欄（SD/SR）跟「稱號」欄（D代號），不能共用同一欄位判斷結果。
+    query_codes = {}
+    for family in _CODE_FAMILIES:
+        for c in family["pattern"].findall(query):
+            nc = _normalize_code(c)
+            if nc not in query_codes:
+                query_codes[nc] = family
 
     if not query_codes:
         return []
@@ -919,17 +938,18 @@ def lookup_grades(query: str, table_index: list):
     candidates = {c: [] for c in query_codes}
     for entry in table_index:
         header, rows = entry["header"], entry["rows"]
-        code_idx = _find_code_column(header, rows)
-        if code_idx is None:
-            continue
-        for row in rows:
-            if code_idx >= len(row):
+        for code, family in query_codes.items():
+            pattern = family["pattern"]
+            code_idx = _find_code_column(header, rows, pattern, family["header_keywords"])
+            if code_idx is None:
                 continue
-            cell_codes = {_normalize_code(tok) for tok in _CODE_PATTERN.findall(row[code_idx])}
-            for cell_code in cell_codes:
-                if cell_code in candidates:
-                    candidates[cell_code].append({
-                        "grade": cell_code,
+            for row in rows:
+                if code_idx >= len(row):
+                    continue
+                cell_codes = {_normalize_code(tok) for tok in pattern.findall(row[code_idx])}
+                if code in cell_codes:
+                    candidates[code].append({
+                        "grade": code,
                         "doc_name": entry["doc_name"],
                         "page": entry["page"],
                         "header": header,
@@ -1121,7 +1141,7 @@ if uploaded_files:
                                 st.markdown(f"來源：{other['doc_name']} {other['page']}")
                                 st.table(pd.DataFrame({"欄位項目": other["header"], "規範數據值": other["row"]}))
             else:
-                st.info("這次查詢沒有偵測到 SD/SR 鋼筋牌號，無規則比對結果。")
+                st.info("這次查詢沒有偵測到 SD/SR 鋼筋牌號或 D 稱號，無規則比對結果。")
 
         with tab_sources:
             for i, doc in enumerate(combined_docs, start=1):
