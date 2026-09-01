@@ -104,6 +104,34 @@ def _upright_only(page):
     )
 
 
+_CLAUSE_NO_RE = re.compile(
+    r"(?m)^\s*(\d+(?:\.\d+){1,3})\s+"
+    r"(?!(?:小時|分鐘|公分|公尺|公斤|mm|cm|kg|kgf|MPa|N/mm|以上|以下|以內|倍|支|組|次|%|％))"
+)
+_TABLE_NO_RE = re.compile(r"表\s*(\d+)")
+
+
+def _extract_clause_no(text: str) -> str:
+    """
+    抓出這段文字裡第一個看起來像規範節號的字串（例如「17.4」「6.3.1」）。
+    CNS 規範慣例是節號自成一行、獨立在段落開頭，用這個位置特徵辨識，
+    避免誤抓到內文裡「依 7.1(b)之規定」這種引用語句裡的數字。
+
+    PDF 換行有時會巧合把一個純數值（例如「1.5 小時」的「1.5」）也排到
+    行首，跟真正的節號格式撞在一起。這裡用負向前瞻擋掉數字後面緊接著
+    常見單位詞的情況，降低這類誤判；仍非萬無一失，只是啟發式規則。
+    找不到就傳回空字串，畫面上會退回只顯示頁碼。
+    """
+    m = _CLAUSE_NO_RE.search(text)
+    return m.group(1) if m else ""
+
+
+def _extract_table_no(caption: str) -> str:
+    """從表格標題句（如「表 9 1組竹節鋼筋質量之許可差」）抓出表格編號「9」。"""
+    m = _TABLE_NO_RE.search(caption)
+    return m.group(1) if m else ""
+
+
 def _find_table_caption(page_text: str, header: list) -> str:
     """
     在頁面原始文字裡找這張表格的標題句（例如 CNS 規範常見的「表 9 1組竹節
@@ -263,9 +291,10 @@ def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
                 for row in tbl["rows"]:
                     md_table += "| " + " | ".join(row) + " |\n"
 
+                table_no = _extract_table_no(tbl["caption"])
                 raw_documents.append(Document(
                     page_content=md_table,
-                    metadata={"page": page_label, "is_table": True}
+                    metadata={"page": page_label, "is_table": True, "table_no": table_no}
                 ))
 
                 table_index.append({
@@ -335,7 +364,12 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
                 if doc.metadata.get("is_table"):
                     docs_out.append(doc)
                 else:
-                    docs_out.extend(text_splitter.split_documents([doc]))
+                    for chunk in text_splitter.split_documents([doc]):
+                        # 幫每個切塊標上節號（例如「17.4」），讓引用來源可以精確到
+                        # 條文節次，而不是只能標到頁碼——頁碼在不同版本規範裡可能
+                        # 改版跳頁，節號通常比較穩定，對規範查詢來說是更可靠的引用。
+                        chunk.metadata["clause_no"] = _extract_clause_no(chunk.page_content)
+                        docs_out.append(chunk)
         return docs_out
 
     # all_docs／table_index 跟向量庫一起存在 persist_dir 底下：Streamlit 進程還在時
@@ -883,7 +917,17 @@ if uploaded_files:
             for i, doc in enumerate(combined_docs, start=1):
                 rerank_score = doc.metadata.get("rerank_score")
                 score_label = f"｜Rerank 分數：{rerank_score:.3f}" if rerank_score is not None else ""
-                st.success(f"📍 引用來源：{doc.metadata.get('doc_name')} ({doc.metadata.get('page')}){score_label}")
+                # 有節號/表號時優先顯示（比頁碼更精確、更不受改版跳頁影響），
+                # 都沒有的頁面（例如純段落條文找不到節號起點）才退回只顯示頁碼。
+                table_no = doc.metadata.get("table_no")
+                clause_no = doc.metadata.get("clause_no")
+                if table_no:
+                    locator = f"表 {table_no}｜{doc.metadata.get('page')}"
+                elif clause_no:
+                    locator = f"第 {clause_no} 節｜{doc.metadata.get('page')}"
+                else:
+                    locator = doc.metadata.get("page")
+                st.success(f"📍 引用來源：{doc.metadata.get('doc_name')} ({locator}){score_label}")
                 st.markdown(doc.page_content)
                 st.divider()
 else:
