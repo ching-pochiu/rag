@@ -312,9 +312,17 @@ def _is_footnote_only_row(row) -> bool:
     文字硬接前一列數值拼湊出來的假資料列（例如 CNS560 表12 續頁最後一列
     就會被拼成「備考：...而 SD 690 690～815 860以上...」這種假列）。
     要在 forward-fill 之前先濾掉，而不是事後才檢查。
+
+    判斷條件只看「整列是不是只有 1 格有內容」，不要求那格文字開頭是
+    「備考」「註」——實測發現 CNS560 表3 的備考列開頭是「{ }內最大值
+    節距適用於螺紋節鋼筋。備考 1. ...」，「備考」兩字前面還有一段說明
+    文字，原本要求開頭比對會漏掉這種格式，導致這一列一樣被 forward-fill
+    回填成假資料列（表3 最後一列會被拼成「{ }內最大值節距...而 18
+    20.2 57.3...」這種假列）。只要整列只有 1 格有內容，就代表這是原始
+    PDF 裡橫跨全欄的合併儲存格，不管文字內容寫什麼都不會是真正的資料列。
     """
     non_empty = [c for c in row if c and str(c).strip()]
-    return len(non_empty) == 1 and non_empty[0].strip().startswith(("備考", "註"))
+    return len(non_empty) == 1
 
 
 def _extract_clean_tables(page, display_page, page_text=""):
@@ -437,6 +445,9 @@ def build_page_mapping(pdf) -> dict:
     return page_mapping
 
 
+_CODE_LIKE_RE = re.compile(r"^[A-Za-z]{0,3}\d{1,4}[A-Za-z]{0,2}$")
+
+
 def _split_table_rows(rows: list, max_rows_per_chunk: int = 6) -> list:
     """
     把表格資料列依內容自然分組，每組各自成一個 chunk，而不是不管表格
@@ -470,6 +481,17 @@ def _split_table_rows(rows: list, max_rows_per_chunk: int = 6) -> list:
     佔掉 chunk 大半篇幅，稀釋掉牌號本身的訊號，導致切乾淨的表格分數
     還是輸給格式亂但牌號寫得很密集的原始文字）。退回整張表一個
     chunk（找不到合適分組欄位）時沒有單一分組依據，group_value 為 None。
+
+    另一種常見結構：像 CNS560 表3（竹節鋼筋標示代號、單位質量等）這種
+    每個項目（D10、D13...D57）各自只佔 1 列、彼此不重複細節列的「純
+    列舉表」。這種表沒有「同一值連續出現 2 列以上」的欄位可分組，但一樣
+    有整張表當一個 chunk、稀釋掉單一項目查詢的問題（實測：問「D32的
+    標稱直徑」，表3 整張 13 列擠在一個 chunk 裡，關聯分數不夠高，完全
+    沒被檢索到）。這種表用「有沒有一欄的值全部長得像代號」判斷：每個
+    值都不重複、且都符合「字母+數字」這種短代號格式（`_CODE_LIKE_RE`），
+    才允許每列各自成一個 chunk——用格式而非「有沒有重複」來判斷，才不會
+    誤傷第一輪已經濾掉的封面/目錄假表格（那些欄位的值格式雜亂，不會
+    整欄都符合代號格式）。
     """
     if len(rows) <= max_rows_per_chunk:
         return [(None, rows)]
@@ -484,6 +506,11 @@ def _split_table_rows(rows: list, max_rows_per_chunk: int = 6) -> list:
                 groups.append([row[col_idx], [row]])
         if len(groups) >= 2 and all(1 < len(g[1]) <= max_rows_per_chunk for g in groups):
             return [(g[0], g[1]) for g in groups]
+
+    for col_idx in range(n_cols):
+        values = [row[col_idx] for row in rows]
+        if len(set(values)) == len(values) and all(_CODE_LIKE_RE.match(v) for v in values):
+            return [(row[col_idx], [row]) for row in rows]
 
     return [(None, rows)]
 
@@ -617,7 +644,13 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     #      不再每個 chunk 都重述一遍完整欄位清單（千篇一律的樣板句會
     #      稀釋牌號本身的訊號，導致 reranker 打分時輸給格式亂但牌號寫
     #      得密集的原始文字）。
-    persist_dir = os.path.join(".chroma_store", "v11_" + files_hash)
+    # v12：_is_footnote_only_row 不再要求備考列開頭是「備考/註」二字，
+    #      只要整列僅 1 格有內容就視為橫跨全欄的合併儲存格（修好表3
+    #      漏抓的「{ }內...備考1...」這種格式）；_split_table_rows 新增
+    #      「純列舉表」判斷，像表3這種每個代號各自 1 列、沒有重複細節列
+    #      的表格，改用代號格式（字母+數字）辨識並逐列切開，避免整張表
+    #      當一個 chunk 稀釋掉單一代號查詢的相關性。
+    persist_dir = os.path.join(".chroma_store", "v12_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
