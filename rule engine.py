@@ -1183,7 +1183,7 @@ if uploaded_files:
             llm_error = None
             try:
                 llm = ChatGoogleGenerativeAI(
-                    model="gemini-3.1-flash-lite",
+                    model="gemini-3.6-flash",
                     google_api_key=API_KEY,
                     temperature=0
                 )
