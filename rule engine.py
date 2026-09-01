@@ -48,7 +48,32 @@ def _looks_like_header_row(row: list) -> bool:
     joined = " ".join(c for c in row if c)
     if re.search(r"(SD|SR)\s*\d", joined):
         return False
-    if re.search(r"\d+\s*(以上|以下|～)", joined):
+    if re.search(r"\d+\s*(?:mm|cm|kg|kgf|MPa|m|t|%|％|℃)?\s*(以上|以下|～)", joined):
+        return False
+    # 純尺寸規格表（例如竹節鋼筋標示代號表）沒有 SD/SR 牌號，也沒有
+    # 「以上/以下」範圍字眼，資料列長得像「D10、3、0.560、9.53...」，
+    # 原本兩條規則都抓不到，會把整張表 17 列全部誤判成表頭、資料列
+    # 一列都不剩，導致整張表被判定「沒有資料」而直接捨棄（實測發現
+    # CNS560 表3「竹節鋼筋標示代號」就是這樣被誤判掉的）。
+    # 補上 D + 數字（如 D10、D57）這種標稱直徑代號當第三種資料列特徵。
+    if re.search(r"\bD\d{1,3}\b", joined):
+        return False
+    # 有些表格（坍度、含氣量、氯離子含量等）資料列純粹是數字，完全沒有
+    # 上面任何關鍵字可以辨識（例如「9.5」「12.5」「0.30 kg/m3」），這種
+    # 表格原本 3 條規則都抓不到、整張表會被誤判成全是表頭而丟棄。
+    # 改用更通用的特徵：一列裡如果有 2 個以上儲存格「看起來像數值」
+    # （純數字，可能帶正負號、範圍符號、單位），就判定為資料列，
+    # 不用再針對每種表格個別列關鍵字。
+    numeric_like = re.compile(r"^[\d０-９±\-+{][\d０-９.,±\-+~－{}%％℃/A-Za-z\s]*$")
+    non_empty = [c.strip() for c in row if c and c.strip()]
+    numeric_cell_count = sum(
+        1 for c in non_empty
+        if numeric_like.match(c) and re.search(r"\d", c)
+    )
+    # 用比例而非固定數量判斷，才能同時涵蓋「很多欄、每欄都要有數值」的寬表格，
+    # 跟「只有2欄、其中1欄是數值」的窄表格（例如氯離子含量表：構件型式/數值）。
+    # 表頭列幾乎不會有任何一格看起來像數值，用 40% 當門檻不容易誤判表頭。
+    if non_empty and numeric_cell_count / len(non_empty) >= 0.4:
         return False
     return True
 
@@ -460,7 +485,9 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     # 的舊快取，就算重啟應用程式、改完的程式碼也不會真的生效。
     # v5：移除行政資訊頁過濾，所有頁面都會入索引。
     # v6：切塊邏輯從「每 500 字元機械切割」改成「依節號/子項邊界切割」。
-    persist_dir = os.path.join(".chroma_store", "v6_" + files_hash)
+    # v7：表格表頭判斷規則加入 D 代號、數值比例判斷，修好多張原本被誤判
+    #     「整張表全是表頭、沒有資料列」而遭丟棄的表格。
+    persist_dir = os.path.join(".chroma_store", "v7_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
