@@ -455,10 +455,12 @@ def _hash_files(file_contents) -> str:
 def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     # _file_contents 底線開頭 → 不參與快取 key 計算，只用來實際執行邏輯
     # files_hash 才是真正決定要不要重新計算的依據
-    # persist_dir 加上 v5 版本前綴：已移除行政資訊頁過濾，所有頁面都會入索引，
-    # 與 v4（會排除行政頁）的解析結果不同，必須換版本號強制重建，
-    # 否則會沿用 v4 舊快取、把行政頁又漏掉。
-    persist_dir = os.path.join(".chroma_store", "v5_" + files_hash)
+    # persist_dir 版本前綴：每次切塊/解析邏輯有重大變動，都必須換版本號強制
+    # 重建，否則磁碟上（Chroma 向量庫 + docs_cache.pkl）會沿用舊版邏輯切出來
+    # 的舊快取，就算重啟應用程式、改完的程式碼也不會真的生效。
+    # v5：移除行政資訊頁過濾，所有頁面都會入索引。
+    # v6：切塊邏輯從「每 500 字元機械切割」改成「依節號/子項邊界切割」。
+    persist_dir = os.path.join(".chroma_store", "v6_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
