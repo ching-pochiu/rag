@@ -711,7 +711,13 @@ def rrf_merge(
         if allowed_keys and key not in allowed_keys:
             continue
         doc = doc_map[key]
-        page_key = (doc.metadata.get("doc_name"), doc.metadata.get("page"))
+        # 同一頁的表格版跟原始文字版各自獨立計算名額（用 is_table 一起當
+        # key），而不是共用同一個上限——原本共用上限時，同一頁如果有兩筆
+        # 原始文字版排名比表格版更前面，會把名額佔滿，表格版連進候選池的
+        # 機會都沒有，之後不管怎麼調分數排序都補救不了（實測發現的案例：
+        # 表格版明明存在，卻完全沒出現在候選名單裡）。分開計算後，同一頁
+        # 的表格版跟文字版可以並存，讓後續分數排序決定最終取捨。
+        page_key = (doc.metadata.get("doc_name"), doc.metadata.get("page"), doc.metadata.get("is_table"))
         if page_counts.get(page_key, 0) >= max_docs_per_page:
             continue
         selected.append(doc)
@@ -741,6 +747,14 @@ def rerank_docs(query: str, docs: list, top_n: int) -> list:
     scores = model.predict(pairs)
     for doc, score in zip(docs, scores):
         doc.metadata["rerank_score"] = float(score)
+        # 乾淨表格版跟同一頁的整頁原始文字版常常分數非常接近（原始文字版
+        # 涵蓋整頁關鍵字，命中面較廣，容易些微贏過只聚焦單一表格的乾淨版），
+        # 導致格式更亂的版本被選中。這裡給表格版一點小加分，只夠打破這種
+        # 微小差距的平手，不會大到蓋過「原始文字真的明顯更相關」的情況
+        # （例如表格辨識失敗、只有原始文字才有內容時，原始文字分數通常會
+        # 大幅領先，不受這個小加分影響）。
+        if doc.metadata.get("is_table"):
+            doc.metadata["rerank_score"] = min(1.0, doc.metadata["rerank_score"] + 0.03)
     ranked = sorted(docs, key=lambda d: d.metadata["rerank_score"], reverse=True)
     # 分數低於門檻的直接捨棄，不硬湊到 top_n 筆——candidate pool 不夠相關時，
     # 寧可少顯示幾筆，也不要把明顯不相關的雜訊也列進畫面（實測過，這種雜訊
