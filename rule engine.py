@@ -376,6 +376,10 @@ RERANK_MODEL = "BAAI/bge-reranker-base"
 # 在資源有限的機器上才跑得起來，代價是排序精準度會比 v2-m3 略遜一籌。
 RRF_CANDIDATE_POOL = 15  # 進 reranker 前的候選池大小，故意留寬一點讓 reranker 有得挑
 FINAL_TOP_N = 6  # reranker 排序後，真正送進 LLM context 與畫面顯示的筆數
+RERANK_SCORE_THRESHOLD = 0.3  # reranker 分數低於此門檻直接捨棄，不硬湊到 FINAL_TOP_N 筆
+# 門檻依實測 10 題結果訂出：真正有用、被答案引用的來源分數多半在 0.36 以上
+# （最低的合理引用約 0.36～0.68），而明顯不相關的雜訊分數多落在 0.05～0.23，
+# 0.3 大致落在兩者中間，能濾掉雜訊又不會誤殺真正有用但分數沒那麼高的來源。
 
 
 def _is_structured_query(query: str) -> bool:
@@ -450,6 +454,19 @@ def rrf_merge(
             scores[key] = scores.get(key, 0.0) + weight / (k + rank + 1)
 
     ranked_keys = sorted(scores.keys(), key=lambda kk: scores[kk], reverse=True)
+
+    # 同一頁如果「乾淨表格版」（is_table=True）跟「整頁原始文字版」同時是候選，
+    # 原始文字版其實只是表格內容跟段落文字黏在一起的雜亂重複——它涵蓋整頁所有
+    # 關鍵字，命中面比單一表格更廣，反而常常搶贏乾淨的表格版，導致使用者看到
+    # 格式雜亂的版本。這裡先找出「哪些頁已經有乾淨表格候選」，選擇時直接排除
+    # 同頁的原始文字版，把版位讓給表格版；沒有表格候選的頁面（純段落條文）
+    # 則不受影響，照常使用原始文字版。
+    has_table_for_page = {
+        (doc_map[key].metadata.get("doc_name"), doc_map[key].metadata.get("page"))
+        for key in ranked_keys
+        if doc_map[key].metadata.get("is_table")
+    }
+
     selected = []
     page_counts = {}
     for key in ranked_keys:
@@ -459,6 +476,8 @@ def rrf_merge(
             continue
         doc = doc_map[key]
         page_key = (doc.metadata.get("doc_name"), doc.metadata.get("page"))
+        if not doc.metadata.get("is_table") and page_key in has_table_for_page:
+            continue
         if page_counts.get(page_key, 0) >= max_docs_per_page:
             continue
         selected.append(doc)
@@ -489,7 +508,11 @@ def rerank_docs(query: str, docs: list, top_n: int) -> list:
     for doc, score in zip(docs, scores):
         doc.metadata["rerank_score"] = float(score)
     ranked = sorted(docs, key=lambda d: d.metadata["rerank_score"], reverse=True)
-    return ranked[:top_n]
+    # 分數低於門檻的直接捨棄，不硬湊到 top_n 筆——candidate pool 不夠相關時，
+    # 寧可少顯示幾筆，也不要把明顯不相關的雜訊也列進畫面（實測過，這種雜訊
+    # 分數通常在 0.2 以下，混在結果裡會讓使用者誤以為系統把不相關內容也當成依據）。
+    filtered = [d for d in ranked if d.metadata["rerank_score"] >= RERANK_SCORE_THRESHOLD]
+    return filtered[:top_n]
 
 
 def get_retrieval_debug(vectorstore, bm25_retriever, query: str, k: int = 12, weights: list | None = None):
