@@ -527,6 +527,35 @@ def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
 
 
 # ──────────────────────────────────────────────────────────────
+# BM25：自訂分詞，修正「牌號代號中間帶空白」查無結果的問題
+# ──────────────────────────────────────────────────────────────
+
+_BM25_CODE_MERGE_RE = re.compile(r"([A-Za-z]{1,4})\s+(\d)")
+
+
+def _bm25_preprocess(text: str) -> list:
+    """
+    BM25 預設分詞（langchain 的 default_preprocessing_func）就是單純的
+    `text.split()`。但 PDF 抽出來的牌號/代號常常中間帶一個空白（例如
+    「SD 420」「D 19」），使用者輸入查詢時卻通常不會加這個空白（打
+    「SD420」「D19」）。兩邊分詞結果完全兜不上時，BM25 對語料庫裡每一
+    份文件的分數都會是 0——這時候 rank_bm25 的 get_top_n 並不會回傳
+    「沒有結果」，而是把同分（都是 0 分）的文件按語料庫原始順序排序
+    後傳回，等於是看起來有分數、實際上是隨機雜訊的結果，卻會頂著這個
+    分數混進 RRF 融合排序，稀釋掉真正該出現的候選（實測發現查「SD420」
+    時，BM25 前 15 名幾乎全是跟鋼筋牌號完全無關的 CNS3090 內容）。
+
+    做法：分詞前先用正則把「字母代號 + 空白 + 數字」這種格式的空白拿
+    掉，讓語料庫跟查詢兩邊都正規化成同樣的形式（不管原文有沒有空白，
+    一律變成「SD420」），兩邊才能真正配對上。這個函式在建語料庫索引、
+    跟查詢時分詞都會用到（BM25Retriever 內部對兩者用同一個
+    preprocess_func），所以兩邊會一致正規化。
+    """
+    normalized = _BM25_CODE_MERGE_RE.sub(r"\1\2", text)
+    return normalized.split()
+
+
+# ──────────────────────────────────────────────────────────────
 # 快取：改用檔案內容雜湊當 key，避免 Streamlit 用底線參數
 # （不列入快取 hash）造成換檔案或重新上傳後仍拿到舊索引/舊頁碼
 # ──────────────────────────────────────────────────────────────
@@ -648,7 +677,10 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
             pickle.dump((all_docs, table_index), f)
 
     vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
-    bm25_retriever = BM25Retriever.from_documents(all_docs) if all_docs else None
+    bm25_retriever = (
+        BM25Retriever.from_documents(all_docs, preprocess_func=_bm25_preprocess)
+        if all_docs else None
+    )
     if bm25_retriever:
         bm25_retriever.k = RETRIEVAL_CANDIDATE_COUNT
 
@@ -719,6 +751,7 @@ def rrf_merge(
     top_n: int = 6,
     weights: list | None = None,
     max_docs_per_page: int = 2,
+    max_table_docs_per_page: int | None = None,
     allowed_keys: set | None = None,
 ):
     """
@@ -735,11 +768,20 @@ def rrf_merge(
     純字面命中的雜訊拉進來，這些頁向量分數過低、不在核可清單內，會被擋掉）。
     傳 None 或空集合時不啟用閘門，退回原本行為，避免向量整批被門檻砍光時
     最終結果一片空白。
+
+    max_table_docs_per_page：table 型文件的每頁名額，None 時沿用
+    max_docs_per_page。大型表格依牌號/稱號分組切成多個 chunk 後，同一頁
+    可能同時有好幾個「同一張表、不同牌號」的 table chunk——這些彼此不是
+    重複內容，而是各自對應不同牌號的獨立資料，不該共用原本設計給「表格版
+    vs 原始文字版」用的窄名額（否則使用者問其中一個牌號，卻可能被同一張
+    表的其他牌號 chunk 排擠掉，完全進不了候選池）。
     """
     if weights is None:
         weights = [1.0] * len(doc_lists)
     if len(weights) != len(doc_lists):
         raise ValueError("weights 數量必須與 doc_lists 相同")
+    if max_table_docs_per_page is None:
+        max_table_docs_per_page = max_docs_per_page
 
     scores = {}
     doc_map = {}
@@ -774,7 +816,8 @@ def rrf_merge(
         # 表格版明明存在，卻完全沒出現在候選名單裡）。分開計算後，同一頁
         # 的表格版跟文字版可以並存，讓後續分數排序決定最終取捨。
         page_key = (doc.metadata.get("doc_name"), doc.metadata.get("page"), doc.metadata.get("is_table"))
-        if page_counts.get(page_key, 0) >= max_docs_per_page:
+        limit = max_table_docs_per_page if doc.metadata.get("is_table") else max_docs_per_page
+        if page_counts.get(page_key, 0) >= limit:
             continue
         selected.append(doc)
         page_counts[page_key] = page_counts.get(page_key, 0) + 1
@@ -1068,18 +1111,29 @@ if uploaded_files:
             doc_bm25 = bm25_retriever.invoke(user_query) if bm25_retriever else []
 
             # 結構化查詢更重視精確關鍵字；一般問題維持語意與關鍵字等權。
-            retrieval_weights = [1.0, 1.8] if _is_structured_query(user_query) else [1.0, 1.0]
+            is_structured_query = _is_structured_query(user_query)
+            retrieval_weights = [1.0, 1.8] if is_structured_query else [1.0, 1.0]
 
             # 向量核可閘門：以通過向量門檻的 doc_vec 當作「有基本向量相關度」的白名單，
             # 讓最終結果只從中挑選，擋掉純靠 BM25 字面命中（例如通用詞「標準」）
             # 但向量根本沒撈到的雜訊頁。doc_vec 為空時傳 None，閘門自動失效、
             # 退回原本行為，避免最終結果一片空白。
-            allowed_keys = {d.page_content for d in doc_vec} if doc_vec else None
+            #
+            # 結構化查詢（SD420、D19 這種精確代號）不套用這道閘門：短短一個
+            # 代號的語意向量，跟同一頁其他代號的表格 chunk（共用大量樣板文字，
+            # 只有代號本身不同）區分度很低，常常真正對的那個 chunk反而沒進
+            # 向量前 k 名，被這道閘門整個擋在外面——即使 BM25 分詞修好後已經能
+            # 精準揪出正確代號。這種查詢下 BM25 精確命中反而比向量相似度更可信，
+            # 讓 reranker（語意層級的最後把關）決定去留即可，不需要這道閘門。
+            allowed_keys = None
+            if not is_structured_query and doc_vec:
+                allowed_keys = {d.page_content for d in doc_vec}
             rrf_candidates = rrf_merge(
                 [doc_vec, doc_bm25],
                 top_n=RRF_CANDIDATE_POOL,
                 weights=retrieval_weights,
                 max_docs_per_page=2,
+                max_table_docs_per_page=6,
                 allowed_keys=allowed_keys,
             )
             combined_docs = rerank_docs(user_query, rrf_candidates, top_n=FINAL_TOP_N)
