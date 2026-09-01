@@ -437,6 +437,49 @@ def build_page_mapping(pdf) -> dict:
     return page_mapping
 
 
+def _split_table_rows(rows: list, max_rows_per_chunk: int = 6) -> list:
+    """
+    把表格資料列依內容自然分組，每組各自成一個 chunk，而不是不管表格
+    有幾列、整張表格永遠塞進同一個 chunk。像 CNS560 表12 這種一張表列出
+    六種鋼筋牌號（SR240～SD420W）、共 18 列的表格，如果整張表當一個
+    chunk，使用者只問其中一個牌號（如「SD420」）時，這個 chunk 的語意
+    /關鍵字相關性會被其他 17 列不相關牌號的資料稀釋，導致同一頁切出來的
+    「整頁原始文字」（天生就是機械式按字數切、恰好切出較小範圍）反而排名
+    更高——不是原始文字比較準，是表格 chunk 太大、被自己的其餘內容拖累。
+
+    做法：由左到右找第一個「同一個值的列連續出現、且每組都是 2～上限列」
+    的欄位（通常是符號/牌號/稱號這種每個值底下固定接幾列細節的欄位），
+    依這個欄位的值分組；每組保留表格原本的資料列順序。
+
+    要求「每一組都要有 2 列以上」是刻意設計得比較嚴格：pdfplumber 對
+    封面、目錄、引用標準清單這類根本不是表格的頁面，常常會誤判出一張
+    假表格，各列內容其實是不相關的段落文字。實測發現這種假表格常常
+    「剛好有某一欄大部分列都不重複、只有零星幾列重複」（例如目錄頁的
+    頁碼欄），如果只要求「有分組就切」，會把這種假表格也切成一堆更小
+    的雜訊 chunk，反而讓雜訊更容易在檢索時排到前面。真正的規範數據
+    表格（像鋼筋機械性質表）裡，同一牌號底下固定會有好幾列彎曲直徑/
+    角度的細節，不會出現「單獨 1 列自成一組」的情況，用這個特徵可以
+    有效區分「真的可以分組的表格」跟「解析誤判出來的假表格」。
+    找不到符合的欄位（包含表格根本不是這種可分組結構時），維持原本
+    整張表當一個 chunk 的行為，不做任何字數式的強制切割。
+    """
+    if len(rows) <= max_rows_per_chunk:
+        return [rows]
+
+    n_cols = len(rows[0])
+    for col_idx in range(n_cols):
+        groups = []
+        for row in rows:
+            if groups and groups[-1][0] == row[col_idx]:
+                groups[-1][1].append(row)
+            else:
+                groups.append([row[col_idx], [row]])
+        if len(groups) >= 2 and all(1 < len(g[1]) <= max_rows_per_chunk for g in groups):
+            return [g[1] for g in groups]
+
+    return [rows]
+
+
 def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
     raw_documents = []
 
@@ -451,18 +494,20 @@ def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
             for tbl in _extract_clean_tables(clean_page, page_label, page_text):
                 header_summary = "、".join(h for h in tbl["header"] if h)
                 caption_line = f"{tbl['caption']}\n" if tbl["caption"] else ""
-                nl_summary = f"{caption_line}本表格說明「{header_summary}」之規範數據對照。\n"
-                md_table = f"\n\n**【{page_label} 表格 {tbl['t_idx']} 規範數據對照表】**\n" + nl_summary
-                md_table += "| " + " | ".join(tbl["header"]) + " |\n"
-                md_table += "| " + " | ".join(["---"] * len(tbl["header"])) + " |\n"
-                for row in tbl["rows"]:
-                    md_table += "| " + " | ".join(row) + " |\n"
-
                 table_no = _extract_table_no(tbl["caption"])
-                raw_documents.append(Document(
-                    page_content=md_table,
-                    metadata={"page": page_label, "is_table": True, "table_no": table_no}
-                ))
+
+                for row_group in _split_table_rows(tbl["rows"]):
+                    nl_summary = f"{caption_line}本表格說明「{header_summary}」之規範數據對照。\n"
+                    md_table = f"\n\n**【{page_label} 表格 {tbl['t_idx']} 規範數據對照表】**\n" + nl_summary
+                    md_table += "| " + " | ".join(tbl["header"]) + " |\n"
+                    md_table += "| " + " | ".join(["---"] * len(tbl["header"])) + " |\n"
+                    for row in row_group:
+                        md_table += "| " + " | ".join(row) + " |\n"
+
+                    raw_documents.append(Document(
+                        page_content=md_table,
+                        metadata={"page": page_label, "is_table": True, "table_no": table_no}
+                    ))
 
                 table_index.append({
                     "doc_name": doc_name,
@@ -508,7 +553,11 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     # v8：過濾掉表格跨頁時，續頁只剩備考說明文字、沒有真正資料列的偽表格。
     # v9：表格最後一列若是橫跨全欄的備考/註合併儲存格，forward-fill 之前先
     #     濾掉，避免被回填成一列混雜備考文字與前一列數值的假資料列。
-    persist_dir = os.path.join(".chroma_store", "v9_" + files_hash)
+    # v10：大型表格依「符號/牌號」等欄位分組切成多個 chunk，避免整張表
+    #      當一個 chunk 時，使用者只問其中一個牌號卻被其餘不相關列稀釋
+    #      相關性；只在每組都恰好 2 列以上時才分組，避免誤判出來的假
+    #      表格（封面、目錄等）也被連帶切成更多雜訊 chunk。
+    persist_dir = os.path.join(".chroma_store", "v10_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
