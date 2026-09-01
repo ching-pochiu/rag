@@ -303,6 +303,20 @@ def _find_table_caption(page_text: str, header: list) -> str:
     return m.group(0).strip() if m else ""
 
 
+def _is_footnote_only_row(row) -> bool:
+    """
+    表格最後常有一列是橫跨全部欄位的備考/註說明文字，在原始 PDF 裡是一個
+    合併儲存格，pdfplumber 抽出來變成「只有第一格有整段文字、其餘格全是
+    None」的列。這種列不是真正的資料列——如果照樣送進 forward-fill，
+    其餘空格會被「前一列」的數值回填，變成一列看起來像資料、實則是備考
+    文字硬接前一列數值拼湊出來的假資料列（例如 CNS560 表12 續頁最後一列
+    就會被拼成「備考：...而 SD 690 690～815 860以上...」這種假列）。
+    要在 forward-fill 之前先濾掉，而不是事後才檢查。
+    """
+    non_empty = [c for c in row if c and str(c).strip()]
+    return len(non_empty) == 1 and non_empty[0].strip().startswith(("備考", "註"))
+
+
 def _extract_clean_tables(page, display_page, page_text=""):
     tables = page.extract_tables()
     if not tables:
@@ -324,7 +338,7 @@ def _extract_clean_tables(page, display_page, page_text=""):
         header_row_count = max(header_row_count, 1)
 
         header_rows = table[:header_row_count]
-        data_rows = table[header_row_count:]
+        data_rows = [r for r in table[header_row_count:] if not _is_footnote_only_row(r)]
 
         header = _merge_header_rows(header_rows, n_cols)
         clean_data_rows = _forward_fill_rows(data_rows, n_cols)
@@ -333,20 +347,11 @@ def _extract_clean_tables(page, display_page, page_text=""):
             if i == 0 or r != clean_data_rows[i - 1]
         ]
 
+        # 有些表格印刷跨頁時，續頁只留下重複的表頭、沒有真正的新資料列
+        # （例如 CNS560 表3 續頁），濾掉備考列後 data_rows 會整個變空，
+        # 這種空殼表格直接捨棄，讓真正的資料（通常已經在同一張表的前一頁
+        # 完整抓到）不會被干擾。
         if not clean_data_rows:
-            continue
-
-        # 有些表格印刷跨頁時，續頁只留下重複的表頭 + 一段備考說明文字
-        # （沒有真正的新資料列，例如 CNS560 表3 續頁），會被誤判成一張
-        # 「有資料」的表格，把備考文字硬套進表格欄位裡，顯示成奇怪的空表格
-        # （欄位都是空的，只有備考文字塞在第一格）。這裡額外檢查：如果
-        # 每一列的第一格都是「備考」開頭的說明文字，代表這其實不是真正的
-        # 資料列，整張表捨棄，讓真正的資料（通常已經在同一張表的前一頁
-        # 完整抓到）不會被這種空殼表格干擾。
-        if all(
-            (r[0] or "").strip().startswith(("備考", "註"))
-            for r in clean_data_rows
-        ):
             continue
 
         cleaned.append({
@@ -501,7 +506,9 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     # v7：表格表頭判斷規則加入 D 代號、數值比例判斷，修好多張原本被誤判
     #     「整張表全是表頭、沒有資料列」而遭丟棄的表格。
     # v8：過濾掉表格跨頁時，續頁只剩備考說明文字、沒有真正資料列的偽表格。
-    persist_dir = os.path.join(".chroma_store", "v8_" + files_hash)
+    # v9：表格最後一列若是橫跨全欄的備考/註合併儲存格，forward-fill 之前先
+    #     濾掉，避免被回填成一列混雜備考文字與前一列數值的假資料列。
+    persist_dir = os.path.join(".chroma_store", "v9_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
