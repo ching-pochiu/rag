@@ -104,7 +104,29 @@ def _upright_only(page):
     )
 
 
-def _extract_clean_tables(page, display_page):
+def _find_table_caption(page_text: str, header: list) -> str:
+    """
+    在頁面原始文字裡找這張表格的標題句（例如 CNS 規範常見的「表 9 1組竹節
+    鋼筋質量之許可差」）。表格清理後的 Markdown 只留下欄位名稱（如「稱號、
+    許可差、備考」），原文標題句裡「竹節鋼筋」「質量」這類關鍵字會整句遺失，
+    導致使用者用這些字眼提問時，語意/關鍵字檢索反而抓不到乾淨的表格版，
+    讓格式更亂的整頁原文搶先命中。
+
+    做法：找「表<數字>」後面、緊接著抵達這張表格第一個欄位標題文字之前的
+    那一小段文字，當作標題摘要。找不到就傳回空字串，不影響原本行為。
+    """
+    first_header = next((h for h in header if h), None)
+    if not first_header:
+        return ""
+    # 表格標題跟第一個欄位標題之間常常隔著換行（pdfplumber 逐行抽字），
+    # 先把換行正規化成空白再比對，才不會被換行擋住比對不到。
+    flat_text = re.sub(r"\s+", " ", page_text)
+    pattern = re.compile(r"表\s*\d+.{0,20}?(?=" + re.escape(first_header) + r")")
+    m = pattern.search(flat_text)
+    return m.group(0).strip() if m else ""
+
+
+def _extract_clean_tables(page, display_page, page_text=""):
     tables = page.extract_tables()
     if not tables:
         tables = page.extract_tables({"vertical_strategy": "text", "horizontal_strategy": "text"})
@@ -141,6 +163,7 @@ def _extract_clean_tables(page, display_page):
             "page": display_page,
             "t_idx": t_idx,
             "header": header,
+            "caption": _find_table_caption(page_text, header),
             "rows": clean_data_rows,
         })
     return cleaned
@@ -230,9 +253,10 @@ def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
             page_text = clean_page.extract_text() or ""
             page_label = page_mapping[pdf_idx]
 
-            for tbl in _extract_clean_tables(clean_page, page_label):
+            for tbl in _extract_clean_tables(clean_page, page_label, page_text):
                 header_summary = "、".join(h for h in tbl["header"] if h)
-                nl_summary = f"本表格說明「{header_summary}」之規範數據對照。\n"
+                caption_line = f"{tbl['caption']}\n" if tbl["caption"] else ""
+                nl_summary = f"{caption_line}本表格說明「{header_summary}」之規範數據對照。\n"
                 md_table = f"\n\n**【{page_label} 表格 {tbl['t_idx']} 規範數據對照表】**\n" + nl_summary
                 md_table += "| " + " | ".join(tbl["header"]) + " |\n"
                 md_table += "| " + " | ".join(["---"] * len(tbl["header"])) + " |\n"
@@ -455,18 +479,14 @@ def rrf_merge(
 
     ranked_keys = sorted(scores.keys(), key=lambda kk: scores[kk], reverse=True)
 
-    # 同一頁如果「乾淨表格版」（is_table=True）跟「整頁原始文字版」同時是候選，
-    # 原始文字版其實只是表格內容跟段落文字黏在一起的雜亂重複——它涵蓋整頁所有
-    # 關鍵字，命中面比單一表格更廣，反而常常搶贏乾淨的表格版，導致使用者看到
-    # 格式雜亂的版本。這裡先找出「哪些頁已經有乾淨表格候選」，選擇時直接排除
-    # 同頁的原始文字版，把版位讓給表格版；沒有表格候選的頁面（純段落條文）
-    # 則不受影響，照常使用原始文字版。
-    has_table_for_page = {
-        (doc_map[key].metadata.get("doc_name"), doc_map[key].metadata.get("page"))
-        for key in ranked_keys
-        if doc_map[key].metadata.get("is_table")
-    }
-
+    # 原本這裡有一條規則：同一頁如果「乾淨表格版」跟「整頁原始文字版」同時是
+    # 候選，就直接排除原始文字版，理由是它常跟表格內容重複、格式較亂。
+    # 但實測發現這條規則太粗暴：有些頁面同時含兩張表，卻只有一張被 pdfplumber
+    # 成功辨識成乾淨表格，另一張的內容就「只存在於原始文字版裡」——這種情況下
+    # 整頁排除等於把那張沒被辨識到的表格資料也一起丟掉，答案反而從「查得到」
+    # 退步成「查無相關規定」。已經改用替代做法解決根本問題：讓表格版的說明文字
+    # 帶回原文標題句（見 `_find_table_caption`），使表格版本來就能靠正常的
+    # 相關性排序贏過原始文字版，不需要再靠這條規則強制排除。
     selected = []
     page_counts = {}
     for key in ranked_keys:
@@ -476,8 +496,6 @@ def rrf_merge(
             continue
         doc = doc_map[key]
         page_key = (doc.metadata.get("doc_name"), doc.metadata.get("page"))
-        if not doc.metadata.get("is_table") and page_key in has_table_for_page:
-            continue
         if page_counts.get(page_key, 0) >= max_docs_per_page:
             continue
         selected.append(doc)
