@@ -135,10 +135,125 @@ def _extract_clause_no(text: str) -> str:
     return m.group(1) or m.group(2)
 
 
+_SUBITEM_RE = re.compile(r"(?m)^\s*(\([a-z]\))\s+")
+
+
+def _split_long_piece(piece: str, max_chunk_chars: int) -> list:
+    """
+    單一條文的內容太長時，優先依「(a)(b)(c)」這種英文字母子項的邊界
+    再切一層——CNS 規範常在同一個節號底下用 (a)(b)(c)(d)... 列出好幾個
+    完全不同主題的規定（例如「5.」底下 (a)是光面鋼筋外觀、(d)才是節距
+    百分比），如果只靠字數切，這些不相關主題會被綁在同一個 chunk 裡，
+    稀釋掉語意，導致查詢其中某一個小主題時反而搜不到。
+    子項切出來後若還是太長，才真的退回字數切割。
+    """
+    sub_starts = [m.start() for m in _SUBITEM_RE.finditer(piece)]
+    if len(sub_starts) < 2:
+        # 沒有子項可切（或只有 1 個，切了也沒意義），直接退回字數切割
+        segments = []
+        for i in range(0, len(piece), max_chunk_chars - 100):
+            sub = piece[i:i + max_chunk_chars].strip()
+            if sub:
+                segments.append(sub)
+        return segments
+
+    sub_spans = []
+    if sub_starts[0] > 0:
+        sub_spans.append((0, sub_starts[0]))
+    for i, start in enumerate(sub_starts):
+        end = sub_starts[i + 1] if i + 1 < len(sub_starts) else len(piece)
+        sub_spans.append((start, end))
+
+    segments = []
+    for start, end in sub_spans:
+        sub_piece = piece[start:end].strip()
+        if not sub_piece:
+            continue
+        if len(sub_piece) <= max_chunk_chars:
+            segments.append(sub_piece)
+        else:
+            for i in range(0, len(sub_piece), max_chunk_chars - 100):
+                sub = sub_piece[i:i + max_chunk_chars].strip()
+                if sub:
+                    segments.append(sub)
+    return segments
+
+
+def _split_by_clause(text: str, max_chunk_chars: int = 400) -> list:
+    """
+    依節號邊界切割整頁文字，讓每個 chunk 盡量對應到一條完整的條文，
+    取代原本「不管內容、每 N 字元機械式切一刀」的做法——後者常常把
+    不相關的兩條條文黏在同一個 chunk（例如「19.」「20.」被切在一起），
+    或是在條文中間斷句，切出「平均值)不得低於0.90f'」這種沒頭沒尾的片段。
+
+    做法：
+    1. 用跟 `_extract_clause_no` 相同的節號偵測規則，找出文字裡所有節號
+       出現的位置，以這些位置為切割點，讓每個 chunk 從節號開頭切齊。
+    2. 切出來的段落如果還是太長（單一條文底下有很多子項目），
+       改用 `_split_long_piece` 優先依 (a)(b)(c) 子項邊界再切一層，
+       只有真的切無可切時才退回字數切割。
+    3. 節號出現之前的文字（例如頁首標題、或完全偵測不到任何節號的頁面，
+       像封面、純表格殘留文字）自成一段，不強行切。
+    4. 完全偵測不到任何節號時，傳回 None，呼叫端會退回原本的字數切割法，
+       不會比原本行為更差。
+    """
+    boundaries = [m.start() for m in _CLAUSE_NO_RE.finditer(text)]
+    if not boundaries:
+        return None
+
+    spans = []
+    if boundaries[0] > 0:
+        spans.append((0, boundaries[0]))
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(text)
+        spans.append((start, end))
+
+    segments = []
+    for start, end in spans:
+        piece = text[start:end].strip()
+        if not piece:
+            continue
+        if len(piece) <= max_chunk_chars:
+            segments.append(piece)
+        else:
+            segments.extend(_split_long_piece(piece, max_chunk_chars))
+
+    # 有些節號底下緊接著又是另一個節號（例如「5.1 膠結材料」後面直接接
+    # 「5.1.1 水硬性水泥」），會切出只有標題、沒有實質內容的極短片段
+    # （例如短短 8 個字），對向量檢索沒有意義，還會佔掉一個候選名額。
+    # 把過短的片段併入下一段（最後一段沒有下一段可併時，併入前一段）。
+    MIN_SEGMENT_CHARS = 20
+    merged = []
+    for seg in segments:
+        if merged and len(merged[-1]) < MIN_SEGMENT_CHARS:
+            merged[-1] = merged[-1] + "\n" + seg
+        else:
+            merged.append(seg)
+    if len(merged) >= 2 and len(merged[-1]) < MIN_SEGMENT_CHARS:
+        merged[-2] = merged[-2] + "\n" + merged.pop()
+    return merged
+
+
 def _extract_table_no(caption: str) -> str:
     """從表格標題句（如「表 9 1組竹節鋼筋質量之許可差」）抓出表格編號「9」。"""
     m = _TABLE_NO_RE.search(caption)
     return m.group(1) if m else ""
+
+
+def locator_for(doc) -> str:
+    """
+    組出一份文件的引用定位標籤：有節號/表號時優先顯示（比頁碼更精確、
+    更不受改版跳頁影響），都沒有的頁面（例如純段落條文找不到節號起點）
+    才退回只顯示頁碼。
+    """
+    table_no = doc.metadata.get("table_no")
+    clause_no = doc.metadata.get("clause_no")
+    page = doc.metadata.get("page")
+    if table_no:
+        return f"表 {table_no}｜{page}"
+    if clause_no:
+        return f"第 {clause_no} 節｜{page}"
+    return page
 
 
 def _find_table_caption(page_text: str, header: list) -> str:
@@ -372,13 +487,28 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
                 doc.metadata["doc_name"] = doc_name
                 if doc.metadata.get("is_table"):
                     docs_out.append(doc)
+                    continue
+
+                # 優先按節號邊界切割，讓每個 chunk 盡量對應到一條完整的條文，
+                # 而不是像 RecursiveCharacterTextSplitter 那樣不管內容、機械式
+                # 每 500 字元切一刀（會把不相關的兩條條文黏在一起，或在條文
+                # 中間斷句）。偵測不到任何節號的頁面（封面、純表格殘留文字等）
+                # 才退回原本的字數切割法，行為不會比原本差。
+                clause_segments = _split_by_clause(doc.page_content)
+                if clause_segments is not None:
+                    chunks = [
+                        Document(page_content=seg, metadata=dict(doc.metadata))
+                        for seg in clause_segments
+                    ]
                 else:
-                    for chunk in text_splitter.split_documents([doc]):
-                        # 幫每個切塊標上節號（例如「17.4」），讓引用來源可以精確到
-                        # 條文節次，而不是只能標到頁碼——頁碼在不同版本規範裡可能
-                        # 改版跳頁，節號通常比較穩定，對規範查詢來說是更可靠的引用。
-                        chunk.metadata["clause_no"] = _extract_clause_no(chunk.page_content)
-                        docs_out.append(chunk)
+                    chunks = text_splitter.split_documents([doc])
+
+                for chunk in chunks:
+                    # 幫每個切塊標上節號（例如「17.4」），讓引用來源可以精確到
+                    # 條文節次，而不是只能標到頁碼——頁碼在不同版本規範裡可能
+                    # 改版跳頁，節號通常比較穩定，對規範查詢來說是更可靠的引用。
+                    chunk.metadata["clause_no"] = _extract_clause_no(chunk.page_content)
+                    docs_out.append(chunk)
         return docs_out
 
     # all_docs／table_index 跟向量庫一起存在 persist_dir 底下：Streamlit 進程還在時
@@ -821,7 +951,14 @@ if uploaded_files:
             )
             combined_docs = rerank_docs(user_query, rrf_candidates, top_n=FINAL_TOP_N)
 
-            context_str = "\n\n".join([doc.page_content for doc in combined_docs])
+            # 每段內容前面都明確標上出處（doc_name + 節號/表號/頁碼），不能只靠
+            # page_content 裡殘留的「--- [ 第 X 頁 ] ---」字樣——切割後的小片段
+            # （例如按條文/子項切出來的 chunk）常常不包含這個頁首字樣，若不額外
+            # 標註，LLM 找不到頁碼線索時就會用猜的（實測過會亂猜成「第 1 頁」）。
+            context_str = "\n\n".join(
+                f"【{doc.metadata.get('doc_name')} {locator_for(doc)}】\n{doc.page_content}"
+                for doc in combined_docs
+            )
 
             system_prompt = (
                 "你是一位專業且嚴謹的土木規範專家。\n"
@@ -933,17 +1070,7 @@ if uploaded_files:
             for i, doc in enumerate(combined_docs, start=1):
                 rerank_score = doc.metadata.get("rerank_score")
                 score_label = f"｜Rerank 分數：{rerank_score:.3f}" if rerank_score is not None else ""
-                # 有節號/表號時優先顯示（比頁碼更精確、更不受改版跳頁影響），
-                # 都沒有的頁面（例如純段落條文找不到節號起點）才退回只顯示頁碼。
-                table_no = doc.metadata.get("table_no")
-                clause_no = doc.metadata.get("clause_no")
-                if table_no:
-                    locator = f"表 {table_no}｜{doc.metadata.get('page')}"
-                elif clause_no:
-                    locator = f"第 {clause_no} 節｜{doc.metadata.get('page')}"
-                else:
-                    locator = doc.metadata.get("page")
-                st.success(f"📍 引用來源：{doc.metadata.get('doc_name')} ({locator}){score_label}")
+                st.success(f"📍 引用來源：{doc.metadata.get('doc_name')} ({locator_for(doc)}){score_label}")
                 st.markdown(doc.page_content)
                 st.divider()
 else:
