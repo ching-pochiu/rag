@@ -336,6 +336,19 @@ def _extract_clean_tables(page, display_page, page_text=""):
         if not clean_data_rows:
             continue
 
+        # 有些表格印刷跨頁時，續頁只留下重複的表頭 + 一段備考說明文字
+        # （沒有真正的新資料列，例如 CNS560 表3 續頁），會被誤判成一張
+        # 「有資料」的表格，把備考文字硬套進表格欄位裡，顯示成奇怪的空表格
+        # （欄位都是空的，只有備考文字塞在第一格）。這裡額外檢查：如果
+        # 每一列的第一格都是「備考」開頭的說明文字，代表這其實不是真正的
+        # 資料列，整張表捨棄，讓真正的資料（通常已經在同一張表的前一頁
+        # 完整抓到）不會被這種空殼表格干擾。
+        if all(
+            (r[0] or "").strip().startswith(("備考", "註"))
+            for r in clean_data_rows
+        ):
+            continue
+
         cleaned.append({
             "page": display_page,
             "t_idx": t_idx,
@@ -487,7 +500,8 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     # v6：切塊邏輯從「每 500 字元機械切割」改成「依節號/子項邊界切割」。
     # v7：表格表頭判斷規則加入 D 代號、數值比例判斷，修好多張原本被誤判
     #     「整張表全是表頭、沒有資料列」而遭丟棄的表格。
-    persist_dir = os.path.join(".chroma_store", "v7_" + files_hash)
+    # v8：過濾掉表格跨頁時，續頁只剩備考說明文字、沒有真正資料列的偽表格。
+    persist_dir = os.path.join(".chroma_store", "v8_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
@@ -1100,7 +1114,17 @@ if uploaded_files:
                 rerank_score = doc.metadata.get("rerank_score")
                 score_label = f"｜Rerank 分數：{rerank_score:.3f}" if rerank_score is not None else ""
                 st.success(f"📍 引用來源：{doc.metadata.get('doc_name')} ({locator_for(doc)}){score_label}")
-                st.markdown(doc.page_content)
+                if doc.metadata.get("is_table"):
+                    # 表格版內容故意用 Markdown 表格語法（| --- |）產生，要用
+                    # st.markdown 才能正常畫出表格。
+                    st.markdown(doc.page_content)
+                else:
+                    # 原始條文全文是直接從 PDF 抽出來的文字，某一行剛好以
+                    # 「#」開頭（例如表格欄位標題本身就是符號「#」）時，
+                    # st.markdown 會誤判成標題語法，整行被放大顯示成標題，
+                    # 跟內容本身完全無關。改用 st.text 純文字顯示，
+                    # 不做任何 Markdown 語法解讀，避免這種誤判。
+                    st.text(doc.page_content)
                 st.divider()
 else:
     st.info("👈 請先於左側邊欄上傳土木規範 PDF 檔案。")
