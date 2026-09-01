@@ -104,18 +104,20 @@ def _upright_only(page):
     )
 
 
+_CLAUSE_NO_UNIT_GUARD = r"(?!(?:小時|分鐘|公分|公尺|公斤|mm|cm|kg|kgf|MPa|N/mm|以上|以下|以內|倍|支|組|次|%|％))"
 _CLAUSE_NO_RE = re.compile(
-    r"(?m)^\s*([1-9]\d?(?:\.\d+){1,3})\s+"
-    r"(?!(?:小時|分鐘|公分|公尺|公斤|mm|cm|kg|kgf|MPa|N/mm|以上|以下|以內|倍|支|組|次|%|％))"
+    r"(?m)^\s*(?:([1-9]\d?(?:\.\d+){1,3})|([1-9]\d?)\.)\s+" + _CLAUSE_NO_UNIT_GUARD
 )
 _TABLE_NO_RE = re.compile(r"表\s*(\d+)")
 
 
 def _extract_clause_no(text: str) -> str:
     """
-    抓出這段文字裡第一個看起來像規範節號的字串（例如「17.4」「6.3.1」）。
-    CNS 規範慣例是節號自成一行、獨立在段落開頭，用這個位置特徵辨識，
-    避免誤抓到內文裡「依 7.1(b)之規定」這種引用語句裡的數字。
+    抓出這段文字裡第一個看起來像規範節號的字串。CNS 規範節號有兩種格式：
+    多層的「17.4」「6.3.1」（数字間用點分隔，後面不須再接句點），以及
+    頂層的「19.」「20.」（單一數字後接句點，用來標示大節/章開頭）。
+    節號慣例自成一行、獨立在段落開頭，用這個位置特徵辨識，避免誤抓到
+    內文裡「依 7.1(b)之規定」這種引用語句裡的數字。
 
     PDF 換行有時會巧合把一個純數值（例如「1.5 小時」的「1.5」、化學成分表
     裡「0.060 以下」的「0.060」）也排到行首，跟真正的節號格式撞在一起。
@@ -128,7 +130,9 @@ def _extract_clause_no(text: str) -> str:
     仍非萬無一失，只是啟發式規則。找不到就傳回空字串，畫面上會退回只顯示頁碼。
     """
     m = _CLAUSE_NO_RE.search(text)
-    return m.group(1) if m else ""
+    if not m:
+        return ""
+    return m.group(1) or m.group(2)
 
 
 def _extract_table_no(caption: str) -> str:
