@@ -462,9 +462,17 @@ def _split_table_rows(rows: list, max_rows_per_chunk: int = 6) -> list:
     有效區分「真的可以分組的表格」跟「解析誤判出來的假表格」。
     找不到符合的欄位（包含表格根本不是這種可分組結構時），維持原本
     整張表當一個 chunk 的行為，不做任何字數式的強制切割。
+
+    回傳格式為 (group_value, rows) 的 list：group_value 是分組依據的值
+    （例如「SD 420」），讓呼叫端可以在自然語言摘要裡明講「這段是哪個
+    牌號」，給 reranker 更明確、更具指向性的訊號，而不是每個 chunk 都
+    只重述一遍完整欄位清單這種千篇一律的樣板句（實測發現這種樣板句
+    佔掉 chunk 大半篇幅，稀釋掉牌號本身的訊號，導致切乾淨的表格分數
+    還是輸給格式亂但牌號寫得很密集的原始文字）。退回整張表一個
+    chunk（找不到合適分組欄位）時沒有單一分組依據，group_value 為 None。
     """
     if len(rows) <= max_rows_per_chunk:
-        return [rows]
+        return [(None, rows)]
 
     n_cols = len(rows[0])
     for col_idx in range(n_cols):
@@ -475,9 +483,9 @@ def _split_table_rows(rows: list, max_rows_per_chunk: int = 6) -> list:
             else:
                 groups.append([row[col_idx], [row]])
         if len(groups) >= 2 and all(1 < len(g[1]) <= max_rows_per_chunk for g in groups):
-            return [g[1] for g in groups]
+            return [(g[0], g[1]) for g in groups]
 
-    return [rows]
+    return [(None, rows)]
 
 
 def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
@@ -496,8 +504,16 @@ def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
                 caption_line = f"{tbl['caption']}\n" if tbl["caption"] else ""
                 table_no = _extract_table_no(tbl["caption"])
 
-                for row_group in _split_table_rows(tbl["rows"]):
-                    nl_summary = f"{caption_line}本表格說明「{header_summary}」之規範數據對照。\n"
+                for group_value, row_group in _split_table_rows(tbl["rows"]):
+                    if group_value:
+                        # 明講「這段是哪個牌號」放在最前面，讓 reranker 一眼就能
+                        # 對上查詢裡的代號，不用等到解析完整張表格才發現相關。
+                        nl_summary = (
+                            f"{caption_line}本段資料對應「{group_value}」之"
+                            f"「{header_summary}」規範數據。\n"
+                        )
+                    else:
+                        nl_summary = f"{caption_line}本表格說明「{header_summary}」之規範數據對照。\n"
                     md_table = f"\n\n**【{page_label} 表格 {tbl['t_idx']} 規範數據對照表】**\n" + nl_summary
                     md_table += "| " + " | ".join(tbl["header"]) + " |\n"
                     md_table += "| " + " | ".join(["---"] * len(tbl["header"])) + " |\n"
@@ -586,7 +602,11 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     #      當一個 chunk 時，使用者只問其中一個牌號卻被其餘不相關列稀釋
     #      相關性；只在每組都恰好 2 列以上時才分組，避免誤判出來的假
     #      表格（封面、目錄等）也被連帶切成更多雜訊 chunk。
-    persist_dir = os.path.join(".chroma_store", "v10_" + files_hash)
+    # v11：分組後的表格 chunk，自然語言摘要改成明講「這段是哪個牌號」，
+    #      不再每個 chunk 都重述一遍完整欄位清單（千篇一律的樣板句會
+    #      稀釋牌號本身的訊號，導致 reranker 打分時輸給格式亂但牌號寫
+    #      得密集的原始文字）。
+    persist_dir = os.path.join(".chroma_store", "v11_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
