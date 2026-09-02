@@ -731,12 +731,22 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
         all_docs = _parse_all()
         if not all_docs:
             raise ValueError("所有 PDF 都解析失敗，沒有可用內容可建立索引：" + "; ".join(parse_errors))
-        vectorstore = Chroma.from_documents(
-            all_docs, embeddings, persist_directory=persist_dir,
+        # 這台機器記憶體有限（僅 7.8GB，常常可用不到 1GB），冷啟動重建索引時
+        # 一次把全部 chunk 送進 Chroma.from_documents() 計算 embedding，是整個
+        # App 尖峰記憶體用量最高的一步——所有 chunk 的文字跟算出來的向量會
+        # 同時留在記憶體裡，實測多次因此被系統砍掉。改成分批 add_documents()，
+        # 每批處理完，前一批的暫存資料就能被回收，尖峰記憶體用量從「全部
+        # chunk 的量」降到「一批的量」，代價是總處理時間會拉長一點點。
+        EMBED_BATCH_SIZE = 200
+        vectorstore = Chroma(
+            embedding_function=embeddings,
+            persist_directory=persist_dir,
             # 明確指定 cosine 相似度空間，搭配上面正規化過的 embedding，
             # relevance score 才會落在正常、可用固定門檻過濾的範圍
             collection_metadata={"hnsw:space": "cosine"},
         )
+        for i in range(0, len(all_docs), EMBED_BATCH_SIZE):
+            vectorstore.add_documents(all_docs[i:i + EMBED_BATCH_SIZE])
         with open(docs_cache_path, "wb") as f:
             pickle.dump((all_docs, table_index), f)
 
