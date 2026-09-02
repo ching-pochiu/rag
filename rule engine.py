@@ -1183,15 +1183,19 @@ if uploaded_files:
             # 但向量根本沒撈到的雜訊頁。doc_vec 為空時傳 None，閘門自動失效、
             # 退回原本行為，避免最終結果一片空白。
             #
-            # 結構化查詢（SD420、D19 這種精確代號）不套用這道閘門：短短一個
-            # 代號的語意向量，跟同一頁其他代號的表格 chunk（共用大量樣板文字，
-            # 只有代號本身不同）區分度很低，常常真正對的那個 chunk反而沒進
-            # 向量前 k 名，被這道閘門整個擋在外面——即使 BM25 分詞修好後已經能
-            # 精準揪出正確代號。這種查詢下 BM25 精確命中反而比向量相似度更可信，
-            # 讓 reranker（語意層級的最後把關）決定去留即可，不需要這道閘門。
-            allowed_keys = None
-            if not is_structured_query and doc_vec:
-                allowed_keys = {d.page_content for d in doc_vec}
+            # 額外把 BM25 排名前 3 名的文件也一律放進白名單，不管是不是結構化
+            # 查詢：BM25 排這麼前面，本身就是很強的字面相關性訊號，不該因為
+            # 向量沒把它排進前 k 名就整個擋掉。原本只對「SD420」這種精確代號
+            # 查詢跳過這道閘門，但實測發現一般問句一樣會中招——問「鋼筋種類
+            # 總共分為幾種」，正確段落（"鋼筋分為9種..."）BM25 排名第 1，卻因為
+            # 沒有 SD/SR 代號、不算結構化查詢，被這道閘門擋掉，AI 只能拿到
+            # 目錄頁的雜訊，答成「查無相關規定」。BM25 前 3 名這麼強的訊號，
+            # 不分查詢類型都該放行，交給 reranker（語意層級的最後把關）決定
+            # 去留即可。
+            allowed_keys = {d.page_content for d in doc_vec} if doc_vec else set()
+            allowed_keys |= {d.page_content for d in doc_bm25[:3]}
+            if not allowed_keys:
+                allowed_keys = None
             rrf_candidates = rrf_merge(
                 [doc_vec, doc_bm25],
                 top_n=RRF_CANDIDATE_POOL,
