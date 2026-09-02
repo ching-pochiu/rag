@@ -95,7 +95,7 @@ flowchart LR
 
 ![檢索來源](screenshots/04_sources.png)
 
-**規則比對：SD/SR 鋼筋牌號直接查表，跟 AI 答案雙軌對照**
+**規則比對：SD/SR 鋼筋牌號與 D 標稱尺寸代號皆可直接查表，跟 AI 答案雙軌對照**
 
 ![規則比對](screenshots/05_rule_lookup.png)
 
