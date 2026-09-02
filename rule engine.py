@@ -531,14 +531,19 @@ def parse_pdf_to_chunks(pdf_file, doc_name, table_index):
                 caption_line = f"{tbl['caption']}\n" if tbl["caption"] else ""
                 table_no = _extract_table_no(tbl["caption"])
 
-                for group_value, row_group in _split_table_rows(tbl["rows"]):
+                split_groups = _split_table_rows(tbl["rows"])
+                for group_value, row_group in split_groups:
                     if group_value:
                         # 明講「這段是哪個牌號」放在最前面，讓 reranker 一眼就能
                         # 對上查詢裡的代號，不用等到解析完整張表格才發現相關。
-                        nl_summary = (
-                            f"{caption_line}本段資料對應「{group_value}」之"
-                            f"「{header_summary}」規範數據。\n"
-                        )
+                        # 註：這裡故意不重述完整欄位清單（header_summary）——
+                        # 實測發現像表3這種欄位名稱又長又多（10 個中文複合詞）的
+                        # 表格，把整串欄位清單塞進每個 chunk 的摘要句，會讓
+                        # 樣板化的欄位名稱字數遠超過真正有區別度的代號本身，
+                        # 稀釋掉 reranker 對這個 chunk 與「XX 代號有哪些」這類
+                        # 清單型查詢的相關性判斷。欄位名稱下面的 markdown 表頭
+                        # 已經有了，不需要在摘要句重複一次。
+                        nl_summary = f"{caption_line}本段資料對應「{group_value}」之規範數據，如下表所列。\n"
                     else:
                         nl_summary = f"{caption_line}本表格說明「{header_summary}」之規範數據對照。\n"
                     md_table = f"\n\n**【{page_label} 表格 {tbl['t_idx']} 規範數據對照表】**\n" + nl_summary
@@ -650,7 +655,17 @@ def build_hybrid_retrievers_cached(_file_contents, files_hash: str):
     #      「純列舉表」判斷，像表3這種每個代號各自 1 列、沒有重複細節列
     #      的表格，改用代號格式（字母+數字）辨識並逐列切開，避免整張表
     #      當一個 chunk 稀釋掉單一代號查詢的相關性。
-    persist_dir = os.path.join(".chroma_store", "v12_" + files_hash)
+    # v13：修正 v11 沒有徹底落實的問題——分組表格 chunk 的摘要句其實
+    #      還是把完整欄位清單（header_summary）重述了一遍，跟 v11 想要
+    #      避免的「樣板句稀釋訊號」問題是同一件事，只是這次影響的是
+    #      清單型查詢（如「代號有哪些」）而非單一代號查詢：reranker 對
+    #      這種樣板句過長的 chunk 打分偏低，導致真正的代號資料排不進
+    #      candidate pool 上限，答案列表漏項。移除摘要句裡的欄位清單。
+    # （v14 曾嘗試在分組切塊後額外補一份「整頁完整表格」chunk，離線診斷
+    #  發現這份合併 chunk 因為過長，向量/BM25 檢索階段就完全排不進候選池
+    #  前 20 名，reranker 根本沒機會看到，等於白做；改用查詢端 table_index
+    #  兜底方案取代，見主查詢流程的「清單型查詢兜底」區塊，故 v14 已撤銷。）
+    persist_dir = os.path.join(".chroma_store", "v13_" + files_hash)
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         # 正規化成單位向量，讓 cosine 距離/相關性分數的計算有意義、
@@ -783,6 +798,17 @@ RERANK_SCORE_THRESHOLD = 0.3  # reranker 分數低於此門檻直接捨棄，不
 # （最低的合理引用約 0.36～0.68），而明顯不相關的雜訊分數多落在 0.05～0.23，
 # 0.3 大致落在兩者中間，能濾掉雜訊又不會誤殺真正有用但分數沒那麼高的來源。
 
+# 「窮舉型清單」問題（例如「有哪些代號」「應記載哪些事項」）實測發現常常
+# 答案數值正確但列表漏項：真正原因是答案項目分散在同一頁的多個 chunk
+# （例如依代號分組切塊的表格，每個代號各自一個 table chunk），但
+# FINAL_TOP_N=6／每頁名額上限把後面的項目擠掉，LLM 拿到的內文本身就不完整，
+# 不是 LLM 生成時漏講。這種問題不能靠調高全域 FINAL_TOP_N 解決（一般問題不需要
+# 這麼多候選，硬塞更多雜訊反而稀釋 reranker 的排序品質），改成偵測到清單型
+# 問句時才動態放寬候選數與同頁名額。
+_LIST_QUERY_RE = re.compile(r"哪些|哪幾種|有幾種|列出|列舉|所有|全部|分為幾")
+LIST_QUERY_TOP_N = 14  # 清單型問題放寬到的候選數，足以涵蓋 13 個 D 代號或 9 項清單
+LIST_QUERY_CANDIDATE_POOL = 20
+
 
 def _is_structured_query(query: str) -> bool:
     return bool(re.search(
@@ -790,6 +816,10 @@ def _is_structured_query(query: str) -> bool:
         query,
         re.IGNORECASE,
     ))
+
+
+def _is_list_query(query: str) -> bool:
+    return bool(_LIST_QUERY_RE.search(query))
 
 
 def vector_search_filtered(vectorstore, query: str, k: int = 8):
@@ -1179,10 +1209,20 @@ if uploaded_files:
     # 也不會每次互動就多打一次 Gemini API。
     if st.button("送出查詢") and user_query:
         with st.spinner("正在透過 Gemini 進行檢索與總結..."):
-            doc_vec = vector_search_filtered(
-                vectorstore, user_query, k=RETRIEVAL_CANDIDATE_COUNT
-            )
-            doc_bm25 = bm25_retriever.invoke(user_query) if bm25_retriever else []
+            # 清單型問題（見 _is_list_query）連向量／BM25 這一層的候選數都要
+            # 同步放寬，否則就算後面 RRF 池與同頁名額都放寬了，源頭的候選
+            # 名單本身在 RETRIEVAL_CANDIDATE_COUNT=15 這關就已經漏掉分散在
+            # 同一頁後段的項目（例如 13 個 D 代號按表格順序排，前面的排名
+            # 自然比較靠前）。
+            is_list_query = _is_list_query(user_query)
+            retrieval_k = LIST_QUERY_CANDIDATE_POOL if is_list_query else RETRIEVAL_CANDIDATE_COUNT
+
+            doc_vec = vector_search_filtered(vectorstore, user_query, k=retrieval_k)
+            if bm25_retriever:
+                bm25_retriever.k = retrieval_k
+                doc_bm25 = bm25_retriever.invoke(user_query)
+            else:
+                doc_bm25 = []
 
             # 結構化查詢更重視精確關鍵字；一般問題維持語意與關鍵字等權。
             is_structured_query = _is_structured_query(user_query)
@@ -1206,15 +1246,67 @@ if uploaded_files:
             allowed_keys |= {d.page_content for d in doc_bm25[:3]}
             if not allowed_keys:
                 allowed_keys = None
+
+            # 清單型問題：放寬候選池與同頁名額，讓分散在同一頁多個 chunk 的
+            # 項目（例如 13 個 D 代號各自一個 table chunk）不會在還沒進 LLM
+            # 之前就被名額擠掉。（is_list_query 已在上面算過，這裡沿用）
+            rrf_pool = LIST_QUERY_CANDIDATE_POOL if is_list_query else RRF_CANDIDATE_POOL
+            final_top_n = LIST_QUERY_TOP_N if is_list_query else FINAL_TOP_N
+            page_quota = 6 if is_list_query else 2
+            table_page_quota = 14 if is_list_query else 6
+
             rrf_candidates = rrf_merge(
                 [doc_vec, doc_bm25],
-                top_n=RRF_CANDIDATE_POOL,
+                top_n=rrf_pool,
                 weights=retrieval_weights,
-                max_docs_per_page=2,
-                max_table_docs_per_page=6,
+                max_docs_per_page=page_quota,
+                max_table_docs_per_page=table_page_quota,
                 allowed_keys=allowed_keys,
             )
-            combined_docs = rerank_docs(user_query, rrf_candidates, top_n=FINAL_TOP_N)
+            combined_docs = rerank_docs(user_query, rrf_candidates, top_n=final_top_n)
+
+            # 清單型查詢兜底：表格切成分組 chunk 後，個別 chunk 在向量／BM25／
+            # RRF 這幾層檢索的排名並不穩定（離線診斷證實：像 D10～D57 這種
+            # 13 個代號各自一個 chunk 的表格，即使放寬候選池與同頁名額，
+            # 分散的單代號 chunk 仍常常整批擠不進候選名單，因為它們要跟
+            # 其他語意相關但答非所問的整頁文字競爭，而合併成一個大 chunk
+            # 又會超出 embedding 模型的 token 上限、反而完全檢索不到）。
+            # 這裡改用另一條不靠 embedding 的路：只要 combined_docs 裡任何
+            # 一筆來源命中的頁碼，剛好在 table_index（PDF 解析時就地存好、
+            # 未經切塊的完整表頭+資料列，也是「規則比對」分頁用的同一份
+            # 資料）裡有對應表格，就把該表格的完整原始內容直接附加進
+            # context，確保清單型答案不會因為分散 chunk 的檢索排名而漏項。
+            if is_list_query:
+                # 只看排名最前面的幾筆來源決定要不要補完整表格，不是整批
+                # combined_docs 都拿來當觸發條件——combined_docs 在清單型
+                # 查詢下可能有 10 幾筆，若每一筆命中的頁面只要剛好有表格
+                # 就整張補進去，遇到答案其實跟表格無關的清單型查詢（例如
+                # 「應記載哪些事項」這種純文字列舉），會塞進大量不相關的
+                # 表格雜訊、稀釋真正相關的內容，卻沒有解決任何問題。只取
+                # 分數最高的前 3 筆，兼顧「真正需要補表格的情況（例如
+                # D 代號表，通常會排在很前面）」與「不誤觸發」。
+                top_pages_for_completion = {
+                    (d.metadata.get("doc_name"), d.metadata.get("page")) for d in combined_docs[:3]
+                }
+                added_table_pages = set()
+                for tbl_entry in table_index:
+                    key = (tbl_entry["doc_name"], tbl_entry["page"])
+                    if key not in top_pages_for_completion or key in added_table_pages:
+                        continue
+                    added_table_pages.add(key)
+                    full_table_md = "| " + " | ".join(tbl_entry["header"]) + " |\n"
+                    full_table_md += "| " + " | ".join(["---"] * len(tbl_entry["header"])) + " |\n"
+                    for row in tbl_entry["rows"]:
+                        full_table_md += "| " + " | ".join(row) + " |\n"
+                    combined_docs.append(Document(
+                        page_content=full_table_md,
+                        metadata={
+                            "doc_name": tbl_entry["doc_name"],
+                            "page": tbl_entry["page"],
+                            "is_table": True,
+                            "rerank_score": 1.0,
+                        },
+                    ))
 
             # 每段內容前面都明確標上出處（doc_name + 節號/表號/頁碼），不能只靠
             # page_content 裡殘留的「--- [ 第 X 頁 ] ---」字樣——切割後的小片段
